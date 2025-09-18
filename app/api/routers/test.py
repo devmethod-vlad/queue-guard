@@ -26,3 +26,15 @@ async def get_task_status(
     """Проверяет статус задачи по ticket_id."""
     response = await service.get_task_status(ticket_id)
     return JSONResponse(content=jsonable_encoder(response, exclude_none=True), status_code=200)
+
+@router.post("/generate", response_model=TaskQueryResponse)
+@inject
+async def generate_answer(
+    query: str,
+    top_k: int = 5,
+    system_prompt: str | None = None,
+    service: FromDishka[IHybridSearchService] = None,
+) -> JSONResponse:
+    """Генерирует ответ. Ставит задачу в очередь и возвращает ticket_id."""
+    response = await service.enqueue_generate(query=query, top_k=top_k, system_prompt=system_prompt)
+    return JSONResponse(content=jsonable_encoder(response, exclude_none=True), status_code=202)

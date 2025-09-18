@@ -51,3 +51,11 @@ class ILLMQueue(abc.ABC):
     @abc.abstractmethod
     async def status(self, ticket_id: str) -> dict[str, tp.Any]:
         """Получение статуса задачи"""
+
+    @abc.abstractmethod
+    async def dequeue_blocking(self, timeout: int = 0) -> tuple[str, dict[str, tp.Any]] | None:
+          """Атомарно: BRPOPLPUSH main -> processing и возврат payload"""
+
+    @ abc.abstractmethod
+    async def ack(self, ticket_id: str) -> None:
+         """Удалить тикет из processing (LREM)"""

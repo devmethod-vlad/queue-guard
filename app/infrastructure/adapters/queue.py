@@ -5,6 +5,7 @@ import time
 import typing as tp
 import uuid
 
+from redis import WatchError
 from redis.asyncio import Redis
 
 from app.infrastructure.adapters.interfaces import ILLMQueue
@@ -23,14 +24,10 @@ class LLMQueue(ILLMQueue):
         self.tprefix = settings.llm_queue.ticket_hash_prefix
         self.max_size = settings.llm_queue.max_size
         self.ticket_ttl = settings.llm_queue.ticket_ttl
+        self.pkey = settings.llm_queue.processing_list_key or f"{self.qkey}:processing"
 
     async def enqueue(self, payload: dict[str, tp.Any]) -> tuple[str, int]:
-        """Постановка задачи в очередь"""
-        n = await self.redis.llen(self.qkey)
-
-        if n is not None and n >= self.max_size:
-            raise OverflowError("LLM queue overflow")
-
+        """Постановка задачи в очередь с учётом позиции и защиты от переполнения."""
         ticket_id = payload["ticket_id"]
         now = int(time.time())
         hkey = f"{self.tprefix}{ticket_id}"
@@ -42,15 +39,40 @@ class LLMQueue(ILLMQueue):
             "task_id": "",
             "error": "",
         }
-        await self.redis.hset(hkey, mapping=data)
 
+        while True:
+            async with self.redis.pipeline() as pipe:
+                try:
+                    # Следим сразу за основной и processing-очередью
+                    await pipe.watch(self.qkey, self.pkey)
 
-        await self.redis.expire(hkey, self.ticket_ttl)
-        await self.redis.rpush(self.qkey, ticket_id)
-        pos = (await self.redis.llen(self.qkey)) or 0
-        print("Задача в очереди")
-        print(pos)
-        return ticket_id, pos
+                    # Текущее количество элементов (ожидающих + в обработке)
+                    queued_len = await pipe.llen(self.qkey) or 0
+                    processing_len = await pipe.llen(self.pkey) or 0
+                    total_len = queued_len + processing_len
+
+                    if total_len >= self.max_size:
+                        await pipe.unwatch()
+                        raise OverflowError(f"LLM queue overflow: {total_len}/{self.max_size}")
+
+                    # Начинаем транзакцию
+                    pipe.multi()
+                    # Записываем мета по тикету
+                    await pipe.hset(hkey, mapping=data)
+                    await pipe.expire(hkey, self.ticket_ttl)
+                    # Ставим тикет в очередь
+                    await pipe.rpush(self.qkey, ticket_id)
+                    # Получаем новую длину qkey (позиция тикета)
+                    await pipe.llen(self.qkey)
+
+                    res = await pipe.execute()
+                    # Последний результат — длина очереди после вставки
+                    pos = int(res[-1]) + processing_len
+                    return ticket_id, pos
+
+                except WatchError:
+                    # Если очередь изменилась между WATCH и EXEC → пробуем заново
+                    continue
 
     async def set_running(self, ticket_id: str, task_id: str) -> None:
         """Установка задачи в статус running"""
@@ -98,15 +120,41 @@ class LLMQueue(ILLMQueue):
         return ticket_id, payload
 
     async def status(self, ticket_id: str) -> dict[str, tp.Any]:
-        """Получение статуса задачи"""
         hkey = f"{self.tprefix}{ticket_id}"
         data = await self.redis.hgetall(hkey)
         if not data:
             return {"state": "not_found"}
-        data = {
-            k.decode(): (v.decode() if isinstance(v, (bytes, bytearray)) else v)
-            for k, v in data.items()
-        }
-        qlen = await self.redis.llen(self.qkey) or 0
-        data["approx_position"] = qlen
+        data = {k.decode(): (v.decode() if isinstance(v, (bytes, bytearray)) else v) for k, v in data.items()}
+
+        q_list = await self.redis.lrange(self.qkey, 0, -1)
+        try:
+            pos = q_list.index(ticket_id.encode())
+        except ValueError:
+            pos = 0
+        data["approx_position"] = pos
         return data
+
+    async def dequeue_blocking(self, timeout: int = 0) -> tuple[str, dict[str, tp.Any]] | None:
+        """"""
+        print("РАсчехляем очередь")
+        raw_tid = await self.redis.brpoplpush(self.qkey, self.pkey, timeout=timeout)
+        if not raw_tid:
+            return None
+
+        ticket_id = raw_tid.decode() if isinstance(raw_tid, (bytes, bytearray)) else str(raw_tid)
+
+        hkey = f"{self.tprefix}{ticket_id}"
+        data = await self.redis.hgetall(hkey)  # можно оставить — сейчас не используется
+        raw = await self.redis.hget(hkey, "payload")
+        if raw is None:
+            print("RAW IS NONE")
+            return ticket_id, {}
+        payload = json.loads(raw.decode()) if isinstance(raw, (bytes, bytearray)) else json.loads(raw)
+        print(payload)
+        return ticket_id, payload
+
+    async def ack(self, ticket_id: str) -> None:
+        """Подтверждение обработки: удаляем из processing."""
+        await self.redis.lrem(self.pkey, 1, ticket_id)
+
+

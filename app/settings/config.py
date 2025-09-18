@@ -59,6 +59,7 @@ class LLMQueueSettings(EnvBaseSettings):
     max_size: int = 7
     ticket_ttl: int = 3600
     drain_interval_sec: int = 1
+    processing_list_key: str | None = None  # список «в обработке»
 
     model_config = SettingsConfigDict(env_prefix="llm_queue_")
 

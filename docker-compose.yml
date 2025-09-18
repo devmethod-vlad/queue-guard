@@ -3,6 +3,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    container_name: queue-web
     env_file:
       - .env
     command: poetry run uvicorn app.main:app --host ${APP_HOST} --port ${APP_PORT} --reload
@@ -18,6 +19,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    container_name: queue-celery
     env_file:
       - .env
     command: poetry run celery -A app.infrastructure.worker.worker worker --loglevel=debug -P solo
@@ -26,22 +28,6 @@ services:
     networks:
       - default
       - service-network
-
-  celery_beat:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    env_file:
-      - .env
-    command: poetry run celery -A  app.infrastructure.worker.worker beat --loglevel=debug
-    volumes:
-      - .:/backend
-    networks:
-      - default
-      - service-network
-
-volumes:
-  redis_data:
 
 networks:
   default:
